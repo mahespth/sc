@@ -1,0 +1,501 @@
+#!/bin/ksh93
+
+################################################################################
+#                                                                              #
+#  Script :  securemqsc
+#  Args   :  see usage
+#  Purpose:  Call runmqsc and execute a know list of commands.
+#                                                                              #
+################################################################################
+#
+################################################################################
+
+# Version information from RCS please
+############################################################
+VERSION='1.1'; VERSION=${VERSION//R*: /}; VERSION=${VERSION//\$/}
+
+# Functions
+############################################################
+
+function _errMsg
+{
+	printf "[E] %s\n" "$@" >&2
+}
+
+function _infoMsg
+{
+	printf "[I] %s\n" "$@" >&2
+}
+
+function _usage
+{
+	print "${PackageName} ${ProgNameShort} ${VERSION}"
+	print ""
+
+	print "usage: ${ProgName} QMgrName {object} {object}"
+	print ""
+	print "usage: ${ProgName} -l"
+	print ""
+}
+
+function _logger
+{
+	[[ ! -z ${DEBUG} ]] && set -x
+
+	return
+
+	/usr/bin/logger -t "${ProgName}" -i -p user.notice "$@"
+}
+
+function _logger_err
+{
+	[[ ! -z ${DEBUG} ]] && set -x
+
+	return
+
+	/usr/bin/logger -t "${ProgName}" -i -p user.err "$@"
+}
+
+#
+# Ensure we have control from user interuptions to commands that we execute
+############################################################
+function _trapcntrlc
+{
+	[[ ! -z ${DEBUG} ]] && set -x
+	
+	# Restore behaviours
+	############################################################
+	trap '' 1 2 3 11 15 EXIT
+
+	return $1
+}
+
+# Debug output of KSH* variables and their configuration
+############################################################
+function debugVars
+{
+	[[ -z $DEBUG ]] && return
+
+	typeset _debugVar _debugVarIndex _debugVarType
+	
+	for _debugVar in $*
+	do
+		typeset \
+		| awk -v V="${_debugVar}" '{
+			if (NF == 2 && $2 == V) { print; exit; }
+			if (NF == 1 && $1 == V) { print "env "$1; exit; }
+			if ($1 == "associative" && $3 == V ) { print "associative "$3; exit; }
+			if ($1 == "indexed" && $3 == V ) { print "indexed "$3; exit; }
+			}' \
+		| read _debugVarType junk
+
+		[[ -z ${_debugVarType} ]] && _debugVarType="unset"
+	
+		case ${_debugVarType} in
+		 associative)
+				for _debugVarIndex in $( eval echo \$\{!${_debugVar}\[\@\]\} )
+				do
+					 eval echo "[D] ${_debugVar}[\\\"$_debugVarIndex\\\"]=\\\"$( echo $\{${_debugVar}[\"${_debugVarIndex}\"\]\} )\\\""
+				done
+				;;
+		 indexed)
+		 		for _debugVarIndex in $( eval echo \$\{!${_debugVar}\[\@\]\} )
+				do
+					eval echo "[D] ${_debugVar}[$_debugVarIndex]=\\\"$( echo $\{${_debugVar}[\"${_debugVarIndex}\"\]\} )\\\""
+				done
+				;;
+		unset)
+				echo "[D] ${_debugVarType} ${_debugVar}"
+       	 		;;
+			 *)		
+		 		eval echo "[D]  ${_debugVarType} \${_debugVar}=\\\"\$${_debugVar}\\\""
+			 	;;
+		esac
+	done
+}
+
+# List available options
+############################################################
+function _listAvailable
+{
+	_infoMsg "Available Managers"
+
+	dspmq -o all \
+	| awk '{ print $1 }' \
+	| while read
+	do
+		_infoMsg " - ${REPLY}"
+	done
+
+	_infoMsg "List of MQSC files"
+	
+	for group in ${_sourceGroups[*]} global
+	do
+		if [[ -d ${MQSC_DIR}/${group} ]]
+		then
+			ls -1F ${MQSC_DIR}/${group} \
+			| grep -v "/" \
+			| while read
+			do
+				_infoMsg "-> ${REPLY}"
+			done
+		fi
+	done
+}
+
+# We depend on knowing what links to what, so a dedicated
+# function to resolve the links is nice and clean
+############################################################
+function _resolve_link
+{
+        [[ ! -z ${DEBUG} ]] && set -x
+
+        typeset   linkName=$1
+        typeset   finalDestination=$1
+        typeset   lastKnownDirectory
+
+        while find ${linkName} -type l -print 2>/dev/null | read linkName
+        do
+                [[ $linkName == @(/*) ]] && lastKnownDirectory=$( dirname $linkName )
+                [[ -z ${lastKnowDirectory} ]] && lastKnowDirectory=$( pwd -P 2>/dev/null )
+                [[ -z ${lastKnowDirectory} ]] && $PWD
+
+                ls -l ${linkName} \
+                | awk '{ print $NF }' \
+                | read linkName
+
+                finalDestination=${linkName}
+        done
+
+        if [[ ${finalDestination} != @(/*) ]]
+        then
+                print "${lastKnownDirectory}/${finalDestination}"
+        else
+                print "${finalDestination}"
+        fi
+
+        if [[ ! -e ${finalDestination} ]]
+        then
+                return 1
+        fi
+
+        return 0
+}
+
+
+# Main
+############################################################
+# Disable globbing, we dont want any kind of playing about!
+############################################################
+PATH=/usr/bin:/usr/sbin:/usr/ucb
+export PATH
+
+# Where is MQ make sure its in the PATH
+############################################################
+if [[ -d /usr/mqm ]]
+then
+	PATH=/usr/mqm/bin:$PATH
+	export PATH
+fi
+
+LANG=C
+export LANG
+
+# Ensure we limit any file write access
+############################################################
+umask 077 
+
+# Paranoid? moi? 
+############################################################
+unset CDPATH
+unset LIBPATH				# IIB requires this for MQSI commands(if you ever run them)
+unset MANPATH
+unset LD_PRELOAD
+
+# IFS !?
+
+set -o noglob
+
+typeset   ProgName=$( basename $0 ); 
+typeset   ProgNameShort=${ProgName/secure/}
+typeset   DirName=$( dirname $0 ); [[ $DirName == "." ]] && DirName=$PWD
+typeset   SecureDirName='/usr/local/bin'
+
+# Debugging? only as root
+############################################################
+if [[ $- == @(*x*) || ! -z $DEBUG ]]
+then
+	if find /tmp/${ProgName}.debug -user root 2>/dev/null | read OK
+	then
+		if [[ $DEBUG == "extended" ]]
+		then
+			# This is intentionall split between two lines..
+			PS4='
+| $LINENO | ${_CODE[$LINENO]} 
+| $LINENO | 	[ $0 ] '; 
+
+			typeset _LINE_NO _LINE
+			typeset _CODE 
+
+			/usr/bin/cat -n ${DirName}/${ProgName} \
+			| while read _LINE_NO _LINE
+			do	
+				_CODE[${_LINE_NO}]="${_LINE}"
+			done
+
+			set -x 
+		else
+			PS4='$LINENO | $0 ] '; set -x 
+			DEBUG=${DEBUG:-"on"}
+
+		fi
+	else
+		set +x
+	fi
+fi
+
+# Make sure no one has tampered with my permissions
+# again we dont give out to much information!
+############################################################
+
+if ! /usr/bin/find $( _resolve_link ${DirName}/${ProgName} ) -user root ! -perm -022 | read OK
+then
+	print -u2 "FATAL ERROR - APPLICATION PERMISSIONS"; exit 1
+fi
+
+if [[ -u $( _resolve_link ${DirName}/${ProgName} ) ]]
+then
+		print -u2 "FATAL ERROR - APPLICATION PERMISSIONS"; exit 1
+fi
+
+# Start of our declarations
+############################################################
+
+typeset    PackageName="securecommands"
+typeset    TTYNUM TTYID			# Who we are (users real id)
+typeset -i ERC=0			# error tracking
+typeset    objectName			# the name of the file or object we are going to manage
+typeset	   saveArgs=$*			# save the current arguments before any processing
+typeset -A args=( $* )			# Array of the arguments for indexed lookup
+typeset -i argIndex=${#args[*]}-1	# number of objects we have indexed
+typeset -i _listOnly= 			# are we just listing our capabilities / objects we can use
+typeset    _fromUser= 			# user that we are doing to list the objects for
+typeset -A _sourceGroups		# The groups of the user that we will use to check their authorisation
+typeset    _longUserName    		# Gecos of the calling ID, required during logging of violations.
+typeset    targetUser			# User we plan on actioning the object as
+typeset -A configData			# Load the config file in memory this time.
+typeset -A shellCmdData			# Load the config file in memory this time.
+typeset    groupName fileSpec	fileSpecParam	# pointers for config data.
+
+typeset    mqManager
+typeset    adminsGroup="mqmadm"
+typeset    MQSC_DIR			# Locatlion of the MQSC files
+typeset    PERL="/usr/bin/perl"		# Location of perl for getopts_long
+
+typeset    PIECE						# $PIECE()
+typeset    var				# used in while read
+typeset    value			# used in while read
+
+if [[ -d ${HOME}/securemqsc ]]
+then
+	typeset MQSC_DIR=${HOME}/securemqsc
+else
+	MQSC_DIR=${HOME}/mqsc
+fi
+
+# Ensure this exists and is a directory
+############################################################
+if [[ ! -d ${MQSC_DIR} ]]
+then
+	_errMsg "Failed to locate ${MQSC_DIR}, stopping."
+	exit 1
+fi
+
+# Make sure no one has made this writable by others!
+############################################################
+if ! /usr/bin/find ${MQSC_DIR} -user ${USER} ! -perm -022 | read OK
+then
+	_errMsg "${MQSC_DIR} permission are insecure, stopping."
+	exit 1
+fi
+
+# We reset these as SUDO can change them.
+# we need to eval the "~" as this can fail in install
+# or background attempts at running the commands
+############################################################
+export USER=$( /usr/bin/whoami )
+export HOME=$( eval echo ~$USER 2>/dev/null )
+
+if [[ -z ${HOME} ]]
+then
+	HOME=$( /usr/sbin/lsuser -a home ${USER} | cut -f2 -d= )
+	export HOME
+fi
+
+if [[ -z ${HOME} ]]
+then
+	_errMsg "Critical error, stopping."
+	exit 1
+fi
+
+
+# Ensure we have options (if we are using the user.cmd syntax
+# then we need to allow this to pass through)
+############################################################
+if [[ -z $1 ]]
+then
+	_usage; exit 0;
+fi
+
+# We depend on syslog to be available to get security messages delivered
+# if there's something missing then we wont run as we are unable to
+# log any actions or exceptions
+############################################################
+if [[ ! -e /dev/log ]]
+then
+	_errMsg "System security logging is broken please contact BAU support asking them to investigate SYSLOG issues."
+	exit 1
+fi
+
+
+# Design:
+############################################################
+# directory contains user runnable scripts
+# special directory contains system scripts or build scripts
+############################################################
+
+
+## Who are you?
+#############################################################
+TTYNUM=$( tty -s && tty )
+TTYNUM=${TTYNUM##*/dev/}
+TTYID=$( /usr/bin/ps -Xft${TTYNUM} -ouser= 2>/dev/null | grep -wv root | awk '$1 != "'$USER'" { print $1; exit }' )
+
+if [[ ! -z $REALUSER && -z ${TTYID} ]]
+then
+	TTYID=${REALUSER}
+fi
+
+if [[ -z ${TTYID} ]]
+then
+	_errMsg "Unable to identify user."
+	exit 127
+fi
+
+# What groups are you a member of?
+############################################################
+_sourceGroups=( $( id -G -n $TTYID ) )
+
+# And who are you really!?
+############################################################
+
+_longUserName=$( lsuser -a gecos ${TTYID} 2>/dev/null | cut -f2-99 -d"="  )
+
+# Check options
+############################################################
+while getopts :l OPTION
+do
+	case $OPTION in
+	 l)	_listAvailable;
+		exit 0;
+		;;
+	 *)	_usage; 
+		exit 0;
+		;;
+	esac
+done
+
+shift $(( OPTIND-1 ))
+
+if [[ -z $1 ]]
+then
+	_usage; exit 1
+fi
+
+mqManager=$1; shift
+
+# Check that these objects exist
+############################################################
+for objectName in $@
+do
+	# We are admins, we can access something different
+	# to the regular guys
+	############################################################
+	if [[ ${_sourceGroups[*]} == @(${adminsGroup}) ]]
+	then
+		if [[ -e ${MQSC_DIR}/${adminsGroup}/${objectName} ]]
+		then
+			continue
+
+		elif [[ -e ${MQSC_DIR}/${adminsGroup}/${objectName}.mqsc ]]
+		then
+			configData["${MQSC_DIR}/${adminsGroup}/${objectName}.mqsc"]=1
+			continue
+		fi
+	fi
+
+	foundObject=''
+	for group in ${_sourceGroups[*]} global
+	do
+		if [[ -d ${MQSC_DIR}/${group} ]]
+		then
+			if [[ -e ${MQSC_DIR}/${group}/${objectName} ]]
+			then
+				configData["${MQSC_DIR}/${group}/${objectName}"]=1; foundObject=1;
+				break
+			fi
+
+			if [[ -e ${MQSC_DIR}/${group}/${objectName}.mqsc ]]
+			then
+				configData["${MQSC_DIR}/${group}/${objectName}.mqsc"]=1; foundObject=1;
+				break
+			fi
+		fi
+	done
+			
+	if [[ -z ${foundObject} ]]
+	then
+		_errMsg "${objectName} not found."
+		exit 1
+	fi
+done
+
+
+# Ensure that we know about this MQ manager.
+############################################################
+if ! dspmq -o all | grep -qw "${mqManager}"
+then
+	_errMsg "${mqManager} not found, please check."
+	exit 1
+fi
+
+for object in ${!configData[@]}
+do
+	if [[ ! -x ${object} ]]
+	then
+		_errMsg "${object} does not have the execute bit set so I am unable to access it."
+		continue
+	fi
+
+	_infoMsg "running: ${object}"
+
+	CMD="runmqsc ${mqManager} <${object}"
+
+	_logger "running: ${CMD} from ${TTYID}@${TTYNUM}"
+
+	# are we going to capture stdout and stderr and log ??
+	############################################################
+	eval "${CMD}"
+	ERC=$?
+	
+	if [[ ${ERC} != 0 ]]
+	then
+		_logger_err "running ${object} from ${TTYID}@${TTYNUM} returned an error, ERC=$ERC"
+	else
+		_logger "running ${object} from ${TTYID}@${TTYNUM} returned no errors."
+	fi
+done
+	
+# Termination
+############################################################
+exit
