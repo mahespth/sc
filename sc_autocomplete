@@ -1,0 +1,89 @@
+################################################################################
+#                                                                              #
+#  Script :  securevi_autocomplete
+#  Args   :  N/A
+#  Purpose:  Provide AUTOCOMPLETE for SC commands within the BASH shell.
+#                                                                              #
+################################################################################
+#
+################################################################################
+
+
+#
+# example setup
+############################################################
+# ~/.bashrc
+############################################################
+# tty -s && . /usr/local/bin/securevi_autocomplete
+############################################################
+
+
+tty -s || return 
+
+[ ${BASH_VERSINFO[0]} -lt 4 ] && echo "[E] only works with bash 4.0 or higher" >&2 && return 1
+[ `type -t complete` != 'builtin' ] && echo "[E] Requires a bash shell that supports programmable command completion" >&2 && return 1
+
+# Function to return objects configured within the secure commands
+############################################################
+function secureBash
+{
+	$1 -l >/dev/null 2>&1
+
+	if [[ $? != 0 ]]
+	then
+		$1 -l
+	else
+		if [[ $1 == @(*.ops) ]]
+		then
+			# *.ops
+			############################################################
+			COMPREPLY=( $( $1 -l | awk -vtwo="^$2" '!/^#/ && $2 ~ two { print $2 }' ) )
+		else
+			# All other secure commands - although some are processes...
+			############################################################
+			if [[ ! -z $2 ]]
+			then
+				COMPREPLY=( $( $1 -l | awk -vtwo="^$2" '!/^#/ && $2 ~ two { print $2 }' ) )
+			else
+				COMPREPLY=( $( $1 -l | awk '!/^#/ { print $2 }' ) )
+			fi
+		fi
+	fi
+}
+
+# Check the locations of the OPSBIN
+
+if [[ ! -z ${_OPSBIN} ]]
+then
+	:
+elif [[ -d ${HOME}/opsbin ]]
+then
+	_OPSBIN="$HOME/opsbin"
+
+elif [[ -d /usr/local/opsbin ]]
+then
+	_OPSBIN="/usr/local/opsbin"
+fi
+
+if [[ ${PATH} != @(*${_OPSBIN}) ]]
+then
+	echo "*** WARNING *** Your PATH does not contain ${_OPSBIN}, autocomplete for securecommands would be so much better with this." >&2
+fi
+
+if [[ -d ${_OPSBIN} ]]
+then
+	for _user in $( ls -1 ${_OPSBIN} )
+	do
+		# Remove any old reference to this
+		complete -r ${_user} 2>/dev/null
+
+		# And add it in again.
+		complete -F secureBash ${_user}
+	done
+else
+	echo "**** WARNING **** No commands are configured in ${_OPSBIN}, update the _OPSBIN variable in your profile to select a different location."
+fi
+
+#
+############################################################
+
